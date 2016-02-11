@@ -1,0 +1,130 @@
+#!/bin/bash
+# goproj/vendorize v1 NNSC:github.com/hlandau/goproj/vendorize/vendorize
+set -e
+
+usage() {
+  echo >&2 "Usage: $0 <command> [args...]"
+  echo >&2 "Commands:"
+  echo >&2 "  freeze [-sqo] <import-path>..."
+  echo >&2 "      -s: strict mode, abort if uncommitted changes detected"
+  echo >&2 "      -q: don't output warnings"
+  echo >&2 "      -o <output-file>"
+  echo >&2 "    Analyzes the import paths and produces a list of imported"
+  echo >&2 "    repositories suitable for passing to thaw."
+  echo >&2 "  thaw [-sq] <listfile> <vendor-dir>"
+  echo >&2 "    Restores the repositories listed in the file to the given"
+  echo >&2 "    directory, which is structured like \$GOPATH/src or a Go 1.5"
+  echo >&2 "    vendor directory."
+  echo >&2 "  buildinfo <import-path>..."
+  echo >&2 "    This is an alias for freeze -q. Its use is recommended"
+  echo >&2 "    when using this tool to generate embedded build information."
+  exit 2
+}
+
+onexit() {
+  [ -n "$outfn" ] && rm "${outfn}.tmp" &>/dev/null || true
+  [ -n "$tgopath" ] && { rm "$tgopath/src"; rmdir "$tgopath"; } || true
+}
+
+check() {
+  echo "$1" | grep -E '\+\s*$' &>/dev/null || return 0
+  [ -n "$quiet" ] ||
+    echo >&2 "*** ${we}: $1: vendored with uncommited changes?"
+  [ "$we" == "WARNING" ] || exit 1
+}
+
+parsearg() {
+  opts_freeze=sqo:
+  opts_thaw=sq
+  local x="opts_$CMD"
+  eval opts=\$$x
+  while getopts "$opts" opt; do
+    case $opt in
+      o)
+        exec 3>"${OPTARG}.tmp"
+        outfd=3; outfn="$OPTARG"
+        ;;
+      s) we=ERROR ;;
+      q) quiet=1 ;;
+      *) exit 2;;
+    esac
+  done
+  nsh=$(($OPTIND-1))
+}
+
+CMD="$1"; outfn=; outfd=1; tgopath=; strict=; we=WARNING; nsh=0; quiet=
+shift || true
+trap onexit EXIT
+[ "$CMD" == "buildinfo" ] && { CMD=freeze; quiet=1; }
+case "$CMD" in
+  freeze)
+    parsearg "$@"; shift $nsh
+    [ -n "$*" ] || usage
+
+    go list -f '{{range $imp := .Deps}}{{printf "%s\n" $imp}}{{end}}' "$@" |
+    sort -u | xargs go list -f '{{if not .Standard}}{{.ImportPath}}{{end}}' |
+    awk "{print \"$GOPATH/src/\" \$0}" |
+    (while read line; do
+      x="$line"
+      while [ ! -e "$x/.git" -a ! -e "$x/.hg" ]; do
+        x=${x%/*}
+        if [ "$x" = "" ]; then
+          break
+        fi
+      done
+      echo "$x"
+    done) |
+    sort -u |
+    (while read line; do
+      [ -e "$line/.git" ] && echo git ${line#$GOPATH/src/} \
+        $(git -C "$line" rev-parse HEAD) \
+        $(git -C "$line" describe --all --dirty=+ --abbrev=99 --always)
+      [ -e "$line/.hg" ] && echo hg ${line#$GOPATH/src/}
+    done; true) | (
+      while read -r line2; do
+        check "$line2"
+        echo "$line2"
+      done) >&$outfd
+    [ -n "$outfn" ] && mv "${outfn}.tmp" "$outfn"
+    outfn=
+    ;;
+
+  thaw)
+    parsearg "$@"; shift $nsh
+    LIST_FILE="$1"
+    VENDOR_DIR="$2"
+    mkdir -p "$VENDOR_DIR"
+    tgopath="$(mktemp -d)"
+    ln -sr "$VENDOR_DIR" "$tgopath/src"
+    [ -n "$LIST_FILE" -a -n "$VENDOR_DIR" ] || usage
+    while IFS='' read -r line || [ -n "$line" ]; do
+      line="$(echo "$line" | sed -e 's/\s+$//g' -e 's/^\s+(#.*)?$//g')"
+      [ -z "$line" ] && continue
+      echo "$line" | while IFS=$' \t' read vcs ipath commit cmt; do
+        echo $vcs $ipath $commit $cmt
+        check "$line"
+        # go get complains if there are no .go files at $ipath.
+        # OTOH, if we use $ipath/..., go get will complain if any
+        # subpackage (that we don't necessarily need) has an error.
+        # -d doesn't eliminate all possibility of errors; import
+        # errors (where a non-needed subpackage imports a path
+        # no longer available, e.g. at Google Code) can still occur.
+        # So, instead let's just assume that if .git/.hg exists
+        # and switching to the commit works everything went okay.
+        GOPATH="$tgopath" go get -d "$ipath" &>/dev/null || true
+        [ -e "$VENDOR_DIR/$ipath/.git" -o -e "$VENDOR_DIR/$ipath/.hg" ] ||
+          { echo >&2 "Failed to download $ipath"; exit 1; }
+        (cd "$VENDOR_DIR/$ipath"
+         case "$vcs" in
+           git) git checkout --quiet "$commit";;
+           hg) hg update -c "$commit";;
+           *) exit 1;;
+       esac)
+      done
+    done < "$LIST_FILE"
+    ;;
+
+  *)
+    usage
+    ;;
+esac
